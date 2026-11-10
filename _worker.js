@@ -5,7 +5,7 @@
  */
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // CORS
@@ -41,9 +41,17 @@ export default {
         });
       }
 
-      // 数据接口
+      // 数据接口（带缓存，10分钟）
       if (url.pathname === '/api/data') {
-        return jsonResponse(await getReports(env));
+        const cache = caches.default;
+        const cacheKey = new Request(url.origin + '/api/data-cache');
+        const cached = await cache.match(cacheKey);
+        if (cached) return cached;
+
+        const data = await getReports(env);
+        const resp = jsonResponse(data);
+        ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+        return resp;
       }
 
       // 启动页
@@ -114,6 +122,13 @@ async function handleUpload(request, env) {
   };
 
   await env.TRAFFIC_KV.put(kvKey, JSON.stringify(report));
+
+  // 清空缓存
+  try {
+    const cache = caches.default;
+    await cache.delete(new Request(new URL(request.url).origin + '/api/data-cache'));
+  } catch (e) {}
+
   return jsonResponse({ ok: true });
 }
 
@@ -161,47 +176,45 @@ function mainHTML() {
 <meta name="theme-color" content="#3b82f6">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <style>
-:root{--bg:#f8fafc;--card:#fff;--border:#e2e8f0;--text:#0f172a;--muted:#64748b;--accent:#3b82f6;--accent-light:#eff6ff}
+:root{--bg:#fff;--card:#fff;--border:#eee;--text:#1a1a1a;--muted:#888;--accent:#0066ff}
 *{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(180deg,#f1f5f9 0%,#f8fafc 100%);color:var(--text);margin:0;padding:24px;min-height:100vh}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fafafa;color:var(--text);margin:0;padding:24px;min-height:100vh}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:16px}
-h1{margin:0;font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,#1e40af,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.tabs{display:flex;gap:2px;background:#fff;padding:4px;border-radius:14px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.05)}
-.tab{padding:8px 16px;border-radius:10px;cursor:pointer;font-size:13px;color:var(--muted);font-weight:500;transition:all .2s}
-.tab:hover{background:var(--accent-light);color:var(--accent)}
-.tab.active{background:var(--accent);color:#fff;box-shadow:0 2px 4px rgba(59,130,246,.3)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}
-.stat{background:var(--card);border-radius:16px;padding:20px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.04);transition:transform .2s,box-shadow .2s}
-.stat:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
-.stat .label{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-.stat .value{font-size:1.8rem;font-weight:700;margin-top:8px;color:var(--text)}
-.stat .value small{font-size:.9rem;font-weight:500;color:var(--muted)}
-.stat .sub{font-size:12px;color:var(--muted);margin-top:6px}
-.stat .detail{font-size:12px;color:#64748b;margin-top:12px;padding-top:12px;border-top:1px solid #f1f5f9;display:flex;gap:12px}
-.chart-box{background:var(--card);border-radius:16px;padding:24px 24px 60px;border:1px solid var(--border);margin-bottom:24px;height:420px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+h1{margin:0;font-size:1.4rem;font-weight:600;color:#111}
+.tabs{display:flex;gap:0;background:#f5f5f5;padding:3px;border-radius:10px}
+.tab{padding:8px 16px;border-radius:8px;cursor:pointer;font-size:13px;color:#666;font-weight:500;transition:all .15s}
+.tab:hover{color:#111}
+.tab.active{background:#fff;color:#111;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:#fff;border-radius:12px;padding:18px;border:1px solid #eee}
+.stat .label{font-size:12px;color:#888}
+.stat .value{font-size:1.6rem;font-weight:600;margin-top:6px;color:#111}
+.stat .value small{font-size:.85rem;font-weight:400;color:#888}
+.stat .sub{font-size:12px;color:#888;margin-top:4px}
+.stat .detail{font-size:12px;color:#666;margin-top:10px;padding-top:10px;border-top:1px solid #f0f0f0}
+.chart-box{background:#fff;border-radius:12px;padding:20px 20px 56px;border:1px solid #eee;margin-bottom:20px;height:400px}
 .chart-box canvas{width:100%!important;height:100%!important}
-.servers{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
-.server{background:var(--card);border-radius:16px;padding:18px 20px;border:1px solid var(--border);cursor:pointer;transition:all .2s;box-shadow:0 1px 3px rgba(0,0,0,.04)}
-.server:hover{border-color:#93c5fd;transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
-.server.active{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.15),0 4px 12px rgba(0,0,0,.06)}
-.server h3{margin:0 0 10px;font-size:1.05rem;font-weight:600;color:var(--text)}
-.server .ip{font-size:12px;color:var(--muted);font-family:ui-monospace,monospace}
-.server .usage{font-size:15px;font-weight:600;margin:8px 0;color:var(--text)}
-.progress{height:10px;background:#e2e8f0;border-radius:5px;margin:12px 0;overflow:hidden}
-.progress>div{height:100%;border-radius:5px;transition:width .4s ease}
-.server .meta{font-size:12px;color:var(--muted);display:flex;justify-content:space-between}
-#customBox{display:none;margin-bottom:20px;padding:14px 18px;background:#fff;border:1px solid #e2e8f0;border-radius:14px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.servers{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.server{background:#fff;border-radius:12px;padding:16px 18px;border:1px solid #eee;cursor:pointer;transition:border-color .15s}
+.server:hover{border-color:#ddd}
+.server.active{border-color:#0066ff;box-shadow:0 0 0 2px rgba(0,102,255,.1)}
+.server h3{margin:0 0 8px;font-size:1rem;font-weight:600;color:#111}
+.server .ip{font-size:12px;color:#888;font-family:ui-monospace,monospace}
+.server .usage{font-size:14px;font-weight:500;margin:8px 0;color:#333}
+.progress{height:6px;background:#f0f0f0;border-radius:3px;margin:10px 0;overflow:hidden}
+.progress>div{height:100%;border-radius:3px}
+.server .meta{font-size:12px;color:#888;display:flex;justify-content:space-between}
+#customBox{display:none;margin-bottom:16px;padding:12px 16px;background:#fff;border:1px solid #eee;border-radius:10px}
 @media(max-width:640px){
   body{padding:16px}
-  h1{font-size:1.25rem}
-  .header{flex-direction:column;align-items:flex-start;gap:14px}
-  .tabs{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;padding:3px}
-  .tab{padding:7px 12px;font-size:12px}
-  .chart-box{height:320px;padding:16px 16px 70px}
-  .servers{grid-template-columns:1fr;gap:12px}
-  .stat{padding:16px}
-  .stat .value{font-size:1.4rem}
-  .server{padding:16px}
+  h1{font-size:1.2rem}
+  .header{flex-direction:column;align-items:flex-start;gap:12px}
+  .tabs{width:100%;overflow-x:auto}
+  .tab{padding:6px 12px;font-size:12px}
+  .chart-box{height:300px;padding:14px 14px 60px}
+  .servers{grid-template-columns:1fr}
+  .stat{padding:14px}
+  .stat .value{font-size:1.3rem}
 }
 </style>
 </head>
@@ -248,7 +261,7 @@ function maskIP(ip){
 function gb(v){
   if(v==null||v==='-'||v==='')return '-';
   var n=parseFloat(v);
-  return isNaN(n)?v:n.toFixed(2);
+  return isNaN(n)?'-':n.toFixed(2);
 }
 function render(){
   var html='';
@@ -284,7 +297,7 @@ function showStats(){
   }
   var pct=max>0?Math.round(used/max*100):0;
   var title=selectedHosts.length===0?'全部':(selectedHosts.length===1?selectedHosts[0]:selectedHosts.length+'台');
-  document.getElementById('stats').innerHTML='<div class="stat"><div class="label">当前</div><div class="value" style="font-size:1rem">'+title+'</div></div><div class="stat"><div class="label">今日</div><div class="value">'+today.toFixed(2)+'<small>GB</small></div><div class="detail">↑'+tx.toFixed(1)+' ↓'+rx.toFixed(1)+'</div></div><div class="stat"><div class="label">累计</div><div class="value">'+used.toFixed(1)+'<small>GB</small></div><div class="sub">限额'+max.toFixed(0)+'</div></div><div class="stat"><div class="label">进度</div><div class="value" style="color:'+(pct>=80?'#ef4444':'#22c55e')+'">'+pct+'%</div></div>';
+  document.getElementById('stats').innerHTML='<div class="stat"><div class="label">当前</div><div class="value" style="font-size:1rem">'+title+'</div></div><div class="stat"><div class="label">今日</div><div class="value">'+today.toFixed(2)+'<small> GB</small></div><div class="detail">↑'+tx.toFixed(2)+' ↓'+rx.toFixed(2)+'</div></div><div class="stat"><div class="label">累计</div><div class="value">'+used.toFixed(2)+'<small> GB</small></div><div class="sub">限额 '+max.toFixed(0)+'</div></div><div class="stat"><div class="label">进度</div><div class="value" style="color:'+(pct>=80?'#ef4444':'#22c55e')+'">'+pct+'%</div></div>';
 }
 function drawChart(){
   var colors=['#22c55e','#3b82f6','#f97316','#a855f7','#ef4444','#06b6d4'];
@@ -312,7 +325,7 @@ function drawChart(){
       }
       var maxH=range==='today'?nowH:23;
       if(!labelBuilt){for(var x=0;x<=maxH;x++)labels.push((x<10?'0':'')+x+':00');labelBuilt=true;}
-      for(var x=0;x<=maxH;x++){var hh=(x<10?'0':'')+x+':00';values.push(map[hh]!=null?+map[hh].toFixed(3):0);}
+      for(var x=0;x<=maxH;x++){var hh=(x<10?'0':'')+x+':00';values.push(map[hh]!=null?+Number(map[hh]).toFixed(2):0);}
     }else{
       var daily=r.daily||{};
       if(!Object.keys(daily).length){
