@@ -286,18 +286,26 @@ function render(){
 }
 function showStats(){
   var list=selectedHosts.length?reports.filter(function(r){return selectedHosts.indexOf(r.host)>=0}):reports;
-  var used=0,max=0,today=0,rx=0,tx=0;
+  var used=0,max=0,todayTotal=0;
+  var now=new Date(Date.now()+8*3600*1000);
+  var todayStr=now.toISOString().slice(0,10);
+  
   for(var i=0;i<list.length;i++){
     var r=list[i];
     used+=parseFloat(r.used_gb)||0;
     max+=parseFloat(r.max_gb)||0;
-    today+=parseFloat(r.today_gb)||0;
-    rx+=parseFloat(String(r.rx||'0').replace(/[^0-9.]/g,''))||0;
-    tx+=parseFloat(String(r.tx||'0').replace(/[^0-9.]/g,''))||0;
+    // 从 daily 或 hourly 累加今日
+    if(r.daily && r.daily[todayStr]){
+      todayTotal+=r.daily[todayStr]/1024;
+    } else if(r.hourly){
+      for(var j=0;j<r.hourly.length;j++){
+        if(r.hourly[j].date===todayStr) todayTotal+=(r.hourly[j].total_mb||0)/1024;
+      }
+    }
   }
   var pct=max>0?Math.round(used/max*100):0;
   var title=selectedHosts.length===0?'全部':(selectedHosts.length===1?selectedHosts[0]:selectedHosts.length+'台');
-  document.getElementById('stats').innerHTML='<div class="stat"><div class="label">当前</div><div class="value" style="font-size:1rem">'+title+'</div></div><div class="stat"><div class="label">今日</div><div class="value">'+today.toFixed(2)+'<small> GB</small></div><div class="detail">↑'+tx.toFixed(2)+' ↓'+rx.toFixed(2)+'</div></div><div class="stat"><div class="label">累计</div><div class="value">'+used.toFixed(2)+'<small> GB</small></div><div class="sub">限额 '+max.toFixed(0)+'</div></div><div class="stat"><div class="label">进度</div><div class="value" style="color:'+(pct>=80?'#ef4444':'#22c55e')+'">'+pct+'%</div></div>';
+  document.getElementById('stats').innerHTML='<div class="stat"><div class="label">当前</div><div class="value" style="font-size:1rem">'+title+'</div></div><div class="stat"><div class="label">今日</div><div class="value">'+todayTotal.toFixed(2)+'<small> GB</small></div></div><div class="stat"><div class="label">累计</div><div class="value">'+used.toFixed(2)+'<small> GB</small></div><div class="sub">限额 '+max.toFixed(0)+'</div></div><div class="stat"><div class="label">进度</div><div class="value" style="color:'+(pct>=80?'#ef4444':'#22c55e')+'">'+pct+'%</div></div>';
 }
 function drawChart(){
   var colors=['#22c55e','#3b82f6','#f97316','#a855f7','#ef4444','#06b6d4'];
