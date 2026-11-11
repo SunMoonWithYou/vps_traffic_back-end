@@ -8,10 +8,10 @@
  *   TRAFFIC_KV - 存储各服务器的流量报告
  * 
  * 接口说明:
- *   GET  /             - 启动页（自动跳转 /home）
- *   GET  /home         - 主面板页面
- *   GET  /api/data     - 获取所有服务器数据（带缓存）
- *   POST /api/upload   - 上报数据（需密钥）
+ *   GET  /             - 启动页
+ *   GET  /home         - 主面板
+ *   GET  /api/data     - 获取数据（30分钟缓存）
+ *   POST /api/upload   - 上报数据（按 device_id 去重）
  *   GET  /manifest.json- PWA 清单
  */
 
@@ -19,7 +19,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 处理 CORS 预检
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -31,12 +30,10 @@ export default {
     }
 
     try {
-      // ========== 上报接口 ==========
       if (request.method === 'POST' && url.pathname === '/api/upload') {
         return await handleUpload(request, env);
       }
 
-      // ========== PWA Manifest ==========
       if (url.pathname === '/manifest.json') {
         return jsonResponse({
           name: "流量监控面板",
@@ -52,20 +49,16 @@ export default {
         });
       }
 
-      // ========== 数据接口（带缓存）==========
       if (url.pathname === '/api/data') {
         const cache = caches.default;
         const cacheKey = new Request(url.origin + '/api/data-cache');
 
-        // 尝试读取缓存
         const cached = await cache.match(cacheKey);
         if (cached) return cached;
 
-        // 缓存未命中，从 KV 读取
         const data = await getReports(env);
         const resp = jsonResponse(data);
 
-        // 写入缓存（30 分钟）
         const toCache = resp.clone();
         toCache.headers.set('Cache-Control', 'public, max-age=1800');
         ctx.waitUntil(cache.put(cacheKey, toCache));
@@ -73,12 +66,10 @@ export default {
         return resp;
       }
 
-      // ========== 启动页 ==========
       if (url.pathname === '/' || url.pathname === '/index.html') {
         return htmlResponse(splashHTML());
       }
 
-      // ========== 主面板 ==========
       if (url.pathname === '/home') {
         return htmlResponse(mainHTML());
       }
@@ -90,13 +81,15 @@ export default {
   }
 };
 
+/** 判断 device_id 是否有效 */
+function isValidDeviceId(id) {
+  if (!id) return false;
+  const s = String(id).trim().toLowerCase();
+  return s && s !== 'unknown' && s !== 'null' && s !== 'undefined' && s !== '-' && s.length > 4;
+}
+
 /**
  * 处理数据上报
- * - 验证密钥
- * - 合并小时数据（去重）
- * - 更新日汇总
- * - 清理过期数据
- * - 清空缓存
  */
 async function handleUpload(request, env) {
   const key = request.headers.get('X-Upload-Key');
@@ -105,13 +98,21 @@ async function handleUpload(request, env) {
   }
 
   const data = await request.json();
-  if (!data.host) return jsonResponse({ error: 'Missing host' }, 400);
+
+  // 确定存储 key：优先 device_id，无效则用 IP
+  let kvKey;
+  if (isValidDeviceId(data.device_id)) {
+    kvKey = 'report:dev:' + data.device_id;
+  } else if (data.ip) {
+    kvKey = 'report:ip:' + data.ip;
+  } else {
+    return jsonResponse({ error: 'Missing device_id and ip' }, 400);
+  }
 
   // 北京时间
   const now = new Date(Date.now() + 8 * 3600 * 1000);
   const bj = now.toISOString().replace('T', ' ').slice(0, 19);
   const today = bj.slice(0, 10);
-  const kvKey = 'report:' + data.host;
 
   // 读取现有数据
   let existing = null;
@@ -143,7 +144,6 @@ async function handleUpload(request, env) {
       if (h.rx_mb != null) entry.rx_mb = Number(h.rx_mb);
       if (h.tx_mb != null) entry.tx_mb = Number(h.tx_mb);
 
-      // 去重：相同 key 则覆盖
       const existIdx = hourlyList.findIndex(x => x.key === hKey);
       if (existIdx >= 0) hourlyList[existIdx] = entry;
       else hourlyList.push(entry);
@@ -151,32 +151,32 @@ async function handleUpload(request, env) {
       touchedDates.add(date);
     }
 
-    // 按时间排序
     hourlyList.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
-    // 清理过期小时数据（保留 14 天）
+    // 保留 14 天小时数据
     const cutoffHourly = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
     hourlyList = hourlyList.filter(x => x.date >= cutoffHourly);
 
-    // 重算本次涉及日期的日汇总
+    // 重算日汇总
     for (const d of touchedDates) {
       const dayHours = hourlyList.filter(x => x.date === d);
       dailyMap[d] = dayHours.reduce((sum, x) => sum + (Number(x.total_mb) || 0), 0);
     }
 
-    // 清理过期日数据（保留 365 天）
+    // 保留 365 天日数据
     const cutoffDaily = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
     for (const d of Object.keys(dailyMap)) {
       if (d < cutoffDaily) delete dailyMap[d];
     }
   }
 
-  // 组装完整报告
+  // 组装报告
   const report = {
-    host: data.host,
+    device_id: isValidDeviceId(data.device_id) ? data.device_id : (existing && existing.device_id) || null,
+    host: data.host || (existing && existing.host) || data.ip || '未知',
     ip: data.ip,
-    mode: data.mode,
     type: data.type,
+    mode: data.mode,
     rx: data.rx,
     tx: data.tx,
     yest_gb: data.yest_gb,
@@ -188,6 +188,7 @@ async function handleUpload(request, env) {
     period_end: data.period_end,
     reset_day: data.reset_day,
     time: data.time || bj,
+    iso: data.iso,
     updated_bj: bj,
     hourly: hourlyList,
     daily: dailyMap
@@ -195,7 +196,7 @@ async function handleUpload(request, env) {
 
   await env.TRAFFIC_KV.put(kvKey, JSON.stringify(report));
 
-  // 上报成功后立即清空缓存
+  // 清空缓存
   try {
     const cache = caches.default;
     await cache.delete(new Request(new URL(request.url).origin + '/api/data-cache'));
@@ -205,11 +206,16 @@ async function handleUpload(request, env) {
 }
 
 /**
- * 从 KV 读取所有服务器报告
+ * 读取所有报告（同时支持 dev 和 ip 两种 key）
  */
 async function getReports(env) {
-  const list = await env.TRAFFIC_KV.list({ prefix: 'report:' });
-  const promises = list.keys.map(item =>
+  const [devList, ipList] = await Promise.all([
+    env.TRAFFIC_KV.list({ prefix: 'report:dev:' }),
+    env.TRAFFIC_KV.list({ prefix: 'report:ip:' })
+  ]);
+
+  const allKeys = [...(devList.keys || []), ...(ipList.keys || [])];
+  const promises = allKeys.map(item =>
     env.TRAFFIC_KV.get(item.name).then(raw => {
       if (!raw) return null;
       try { return JSON.parse(raw); } catch (e) { return null; }
@@ -220,8 +226,6 @@ async function getReports(env) {
   reports.sort((a, b) => (a.host || '').localeCompare(b.host || ''));
   return reports;
 }
-
-// ========== 工具函数 ==========
 
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
@@ -236,12 +240,10 @@ function htmlResponse(html) {
   });
 }
 
-/** 启动页 HTML */
 function splashHTML() {
   return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>流量监控</title><link rel="icon" href="https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic_back-end/main/vps-traffic-logo-icon.ico"><style>body{margin:0;background:#fafafa;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:system-ui,sans-serif}.logo{width:96px;height:96px;border-radius:20px;margin-bottom:16px}.title{font-size:1.3rem;font-weight:600;color:#111}.sub{margin-top:12px;font-size:13px;color:#888}</style></head><body><img class="logo" src="https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic_back-end/main/vps-traffic-logo-192.png" alt="logo"><div class="title">流量监控面板</div><div class="sub">加载中...</div><script>setTimeout(function(){location.href="/home"},600)</script></body></html>';
 }
 
-/** 主面板 HTML（含完整前端逻辑） */
 function mainHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -329,10 +331,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </div>
 <div class="servers" id="servers"></div>
 <script>
-// ========== 全局状态 ==========
 var reports=[], range='today', chart=null, selectedHosts=[];
 
-// 初始加载数据
 fetch('/api/data?t='+Date.now()).then(function(r){return r.json()}).then(function(d){
   reports=d||[];
   render();
@@ -340,28 +340,24 @@ fetch('/api/data?t='+Date.now()).then(function(r){return r.json()}).then(functio
   document.getElementById('servers').innerHTML='<div style="padding:20px;color:#888">加载失败</div>';
 });
 
-// IP 脱敏
 function maskIP(ip){
   if(!ip||ip==='-')return '-';
   var p=String(ip).split('.');
   return p.length===4?p[0]+'.'+p[1]+'.*.*':ip;
 }
 
-// 格式化 GB
 function gb(v){
   if(v==null||v==='-'||v==='')return '-';
   var n=parseFloat(v);
   return isNaN(n)?'-':n.toFixed(2);
 }
 
-// 提取时间（HH:mm）
 function formatTime(bj){
   if(!bj) return '';
   var m = bj.match(/(\\d{2}:\\d{2})/);
   return m ? m[1] : '';
 }
 
-// 计算今日流量（GB）
 function getTodayGB(r){
   var now=new Date(Date.now()+8*3600*1000);
   var todayStr=now.toISOString().slice(0,10);
@@ -375,7 +371,6 @@ function getTodayGB(r){
   return (total/1024).toFixed(2);
 }
 
-// 渲染整个页面
 function render(){
   var html='';
   for(var i=0;i<reports.length;i++){
@@ -399,7 +394,6 @@ function render(){
   }
   document.getElementById('servers').innerHTML=html;
   
-  // 绑定服务器卡片点击（多选）
   var cards=document.querySelectorAll('.server');
   for(var i=0;i<cards.length;i++){
     cards[i].onclick=function(){
@@ -413,7 +407,6 @@ function render(){
   drawChart();
 }
 
-// 显示顶部统计卡片
 function showStats(){
   var list=selectedHosts.length?reports.filter(function(r){return selectedHosts.indexOf(r.host)>=0}):reports;
   var used=0,max=0,todayTotal=0;
@@ -437,7 +430,6 @@ function showStats(){
   document.getElementById('stats').innerHTML='<div class="stat"><div class="label">当前</div><div class="value" style="font-size:1rem">'+title+'</div></div><div class="stat"><div class="label">今日</div><div class="value">'+todayTotal.toFixed(2)+'<small> GB</small></div></div><div class="stat"><div class="label">累计</div><div class="value">'+used.toFixed(2)+'<small> GB</small></div><div class="sub">限额 '+max.toFixed(0)+'</div></div><div class="stat"><div class="label">进度</div><div class="value" style="color:'+(pct>=80?'#ef4444':'#22c55e')+'">'+pct+'%</div></div>';
 }
 
-// 绘制图表（支持动态单位 tooltip）
 function drawChart(){
   var colors=['#22c55e','#3b82f6','#f97316','#a855f7','#ef4444','#06b6d4'];
   var datasets=[];
@@ -452,7 +444,7 @@ function drawChart(){
 
   var labels = [];
   var isHourly = (range==='today'||range==='yesterday');
-  var rawValues = []; // 用于判断整体单位（轴用）
+  var rawValues = [];
 
   if(isHourly){
     var maxH = range==='today' ? nowH : 23;
@@ -476,7 +468,6 @@ function drawChart(){
     labels = dates.length ? dates : ['暂无'];
   }
 
-  // 收集原始值（单位 GB）
   selected.forEach(function(r){
     var hourly = r.hourly || [];
     if(isHourly){
@@ -501,7 +492,6 @@ function drawChart(){
     }
   });
 
-  // 轴的单位（根据最大值决定）
   var maxVal = Math.max.apply(null, rawValues.concat([0]));
   var unit = 'GB';
   var scale = 1;
@@ -513,7 +503,6 @@ function drawChart(){
     scale = 1/1024;
   }
 
-  // 构建 datasets
   selected.forEach(function(r, idx){
     var values = [];
     var hourly = r.hourly || [];
@@ -573,9 +562,8 @@ function drawChart(){
         mode: 'index',
         intersect: false,
         callbacks: {
-          // 每个点单独判断单位
           label: function(ctx){
-            var valGB = ctx.parsed.y / scale; // 还原成 GB
+            var valGB = ctx.parsed.y / scale;
             var display, unitStr;
             if (valGB < 1) {
               display = (valGB * 1024).toFixed(1);
@@ -617,7 +605,6 @@ function drawChart(){
   }
 }
 
-// 选项卡切换
 document.getElementById('tabs').onclick=function(e){
   var t=e.target.closest('.tab');if(!t)return;
   var tabs=document.querySelectorAll('.tab');
@@ -629,7 +616,6 @@ document.getElementById('tabs').onclick=function(e){
 };
 document.getElementById('applyCustom').onclick=function(){render()};
 
-// 每 60 秒自动刷新
 setInterval(function(){
   fetch('/api/data?t='+Date.now()).then(function(r){return r.json()}).then(function(d){
     reports=d||[];
@@ -637,7 +623,6 @@ setInterval(function(){
   });
 }, 60000);
 
-// 页面重新可见时刷新
 document.addEventListener('visibilitychange', function(){
   if(document.visibilityState==='visible'){
     fetch('/api/data?t='+Date.now()).then(function(r){return r.json()}).then(function(d){
