@@ -816,14 +816,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 #legend{display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:center;padding-top:10px;font-size:12px;color:#666}
 .legend-item{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none;max-width:100%}
 .legend-item .swatch{width:10px;height:10px;border-radius:2px;flex:none}
-.legend-item .legend-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:9em}
+.legend-item .legend-name{white-space:normal;word-break:break-word;overflow-wrap:anywhere}
 .legend-item.off{opacity:.35}
 .legend-item.off .legend-name{text-decoration:line-through}
 .servers{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
 .server{background:#fff;border-radius:14px;padding:16px 18px;border:1px solid var(--border);cursor:pointer;transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 3px rgba(0,0,0,.04)}
 .server:hover{border-color:#c7d2fe;box-shadow:0 4px 12px rgba(0,102,255,.08)}
 .server.active{border-color:#0066ff;box-shadow:0 0 0 3px rgba(0,102,255,.12)}
-.server h3{margin:0 0 4px;font-size:1rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.server h3{margin:0 0 4px;font-size:1rem;font-weight:600;white-space:normal;word-break:break-word;overflow-wrap:anywhere}
 .server .sub{font-size:12px;color:#888;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .server .sub .today{color:#0066ff;font-weight:500}
 .server .ip{font-size:11px;color:#aaa;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:2px}
@@ -847,7 +847,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   .tabs::-webkit-scrollbar{display:none}
   .tab{padding:6px 12px;font-size:12px}
   .chart-box{height:340px;padding:12px 14px}
-  .legend-item .legend-name{max-width:7em}
   .servers{grid-template-columns:1fr}
   .stat{padding:14px}
   .stat .value{font-size:1.3rem}
@@ -1077,7 +1076,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   // ── 图表 ───────────────────────────────────────────────────────────────
   function buildLabels(isHourly) {
     if (isHourly) {
-      var maxH = state.range === 'today' ? bjNow().getUTCHours() : 23;
+      // 当前小时还没结束，上报脚本必然还没提交这一小时的数据，直接不画；
+      // 已经结束的小时一律画出来，没上报的按 0 补齐。
+      // 昨天 24 小时全部已结束，固定画满 00:00~23:00。
+      var maxH = state.range === 'today' ? bjNow().getUTCHours() - 1 : 23;
       var labels = [];
       for (var h = 0; h <= maxH; h++) labels.push(pad2(h) + ':00');
       return { labels: labels, hourlyMap: null };
@@ -1179,7 +1181,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     var scopeLabel = state.selected.size ? state.selected.size + '台' : '全部';
     el.desc.textContent =
       (RANGE_TITLES[range] || '') + ' · ' + scopeLabel + ' · 单位：' + unitInfo.unit +
-      (state.generatedAt ? ' · 更新于 ' + state.generatedAt.slice(11) : '');
+      (state.generatedAt ? ' · 更新于 ' + state.generatedAt.slice(11) : '') +
+      (isHourly && !labels.length ? ' · 当天暂无完整小时数据' : '');
 
     var options = {
       responsive: true,
