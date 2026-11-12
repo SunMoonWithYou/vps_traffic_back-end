@@ -847,9 +847,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   .tabs::-webkit-scrollbar{display:none}
   .tab{padding:6px 12px;font-size:12px}
   .chart-box{height:340px;padding:12px 14px}
-  /* 手机没有 hover，凡靠 title 悬停看全名的地方一律改为完整显示 */
-  .legend-item .legend-name{max-width:none;white-space:normal;word-break:break-word}
-  .server h3{white-space:normal;word-break:break-word}
+  .legend-item .legend-name{max-width:7em}
   .servers{grid-template-columns:1fr}
   .stat{padding:14px}
   .stat .value{font-size:1.3rem}
@@ -1188,10 +1186,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       maintainAspectRatio: false,
       animation: { duration: 250 },
       interaction: { mode: 'index', intersect: false },
-      // 事件驱动完全关闭（Chart.js 不再自行响应鼠标/触摸），tooltip 由下方
-      // bindChartEvents 统一接管：桌面 mousemove 跟随、移动端 tap 锁定切换。
-      // 这样也天然规避了移动端 tap 后浏览器合成鼠标事件反复激活 tooltip 的问题。
-      events: [],
       plugins: {
         // 画布内图例单行绘制、不会换行，机器一多就被裁掉；
         // 改用图表下方的 HTML 图例（#legend），可自动换行、可点击隐藏系列
@@ -1267,76 +1261,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       state.chart.update('none');
       item.classList.toggle('off', willShow);
     });
-  }
-
-  // ── tooltip 事件接管 ────────────────────────────────────────────────────
-  // Chart.js 的事件响应已关闭（events: []），tooltip 完全由这里控制：
-  //   桌面：mousemove 跟随列、移出图表关闭
-  //   移动：tap 一次锁定显示，再点同一列关闭，点其他列切换
-  // events: [] 之后，tap 合成的鼠标事件不会触发任何 Chart.js 行为，天然无干扰。
-  function bindChartEvents() {
-    var hoverIdx = null;      // 桌面 hover 当前列
-    var lockedIndex = null;   // 移动端锁定的列
-    var lastTouchEnd = 0;
-
-    function setTooltip(elements, pos) {
-      if (!state.chart) return;
-      state.chart.tooltip.setActiveElements(elements, pos);
-      // 不能用 update('none')：会跳过 tooltip 过渡动画，opacity 停在 0 不显示
-      state.chart.update();
-    }
-
-    function elementsAt(e) {
-      if (!state.chart) return [];
-      return state.chart.getElementsAtEventForMode(e, 'index', { intersect: false }, false) || [];
-    }
-
-    function pointFrom(e) {
-      var rect = el.canvas.getBoundingClientRect();
-      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
-    }
-
-    // 桌面 hover（触摸后 400ms 内的合成鼠标事件直接忽略）
-    el.canvas.addEventListener('mousemove', function (e) {
-      if (Date.now() - lastTouchEnd < 400) return;
-      var points = elementsAt(e);
-      var idx = points.length ? points[0].index : null;
-      if (idx === hoverIdx) return;
-      hoverIdx = idx;
-      lockedIndex = null;
-      setTooltip(idx != null ? [points[0]] : [], pointFrom(e));
-    });
-
-    el.canvas.addEventListener('mouseleave', function () {
-      hoverIdx = null;
-      lockedIndex = null;
-      setTooltip([]);
-    });
-
-    // 移动端 tap
-    el.canvas.addEventListener('touchend', function (e) {
-      lastTouchEnd = Date.now();
-      if (!state.chart) return;
-      var t = e.changedTouches && e.changedTouches[0];
-      if (!t) return;
-
-      // touchend 时 e.touches 已为空，Chart.js 取不到坐标，用 changedTouches 合成
-      var synthetic = { clientX: t.clientX, clientY: t.clientY };
-      var points = elementsAt(synthetic);
-      if (!points.length) return;
-
-      var idx = points[0].index;
-      var pos = pointFrom(t);
-
-      // 再点同一列 → 关闭；其他列 → 切换
-      if (lockedIndex === idx) {
-        lockedIndex = null;
-        setTooltip([], pos);
-        return;
-      }
-      lockedIndex = idx;
-      setTooltip([points[0]], pos);
-    }, { passive: true });
   }
 
   function render() {
@@ -1484,7 +1408,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   });
 
   bindLegendToggle();
-  bindChartEvents();
   load().then(startPolling);
 })();
 <\/script>
