@@ -2,7 +2,7 @@
  * ============================================================================
  * VPS 流量监控面板 · Cloudflare Worker
  * ============================================================================
- * 
+ *
  * 环境变量
  *   UPLOAD_KEY    必填。上报密钥，请求头 X-Upload-Key
  *   PANEL_TOKEN   选填。面板访问令牌。配置后 /home 与 /api/data 需要鉴权，
@@ -19,7 +19,11 @@
  *   GET  /healthz       健康检查
  *   GET  /api/data      获取数据（边缘缓存 60s）
  *   POST /api/upload    上报数据（按 device_id 去重，回退到真实 IP）
- * ============================================================================
+ *
+ * 存储布局
+ *   report:dev:<device_id>   设备有效时的主键
+ *   report:ip:<ip>           无有效 device_id 时的回退主键
+ *   两种前缀统一用 report: 前缀一次 list 取回，避免两次分页查询
  */
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -27,17 +31,29 @@
 // ══════════════════════════════════════════════════════════════════════════
 
 const CONFIG = Object.freeze({
+  /** 小时数据保留天数。前端只用今天+昨天两天，3 天留一天缓冲即可。
+   *  这是 value 体积的主要来源：14 天比 3 天多占约 20 KB，且每次上报都要整体重写一遍。
+   *  确有按小时回溯更久的需求时再调大，代价是写放大线性增长。 */
   HOURLY_RETENTION_DAYS: 3,
+  /** 日汇总保留天数 */
   DAILY_RETENTION_DAYS: 365,
+  /** /api/data 边缘缓存秒数。过长会导致面板数据陈旧，60s 是体验与成本的平衡点 */
   DATA_CACHE_TTL: 60,
+  /** 单次上报允许的小时条目上限，防止恶意构造超大数组打满 CPU */
   MAX_HOURLY_ENTRIES: 400,
+  /** 请求体大小上限（字节） */
   MAX_BODY_BYTES: 512 * 1024,
+  /** 并发读取 KV 的批大小，需低于 Workers 免费版 50 次 subrequest 上限 */
   KV_CONCURRENCY: 16,
+  /** 最多返回的报告数量，超出部分丢弃 */
   MAX_REPORTS: 500,
+  /** 下发给前端的小时数据天数（daily 已含完整历史，无需全量传 hourly） */
   CLIENT_HOURLY_DAYS: 2,
+  /** 面板 Cookie 有效期（秒） */
   PANEL_COOKIE_MAX_AGE: 60 * 60 * 24 * 30,
 });
 
+/** 北京时间偏移，Worker 运行在 UTC，所有「日期」语义一律走这里 */
 const BJ_OFFSET_MS = 8 * 60 * 60 * 1000;
 const KV_PREFIX = 'report:';
 const DATA_CACHE_PATH = '/__cache/api-data';
@@ -47,30 +63,36 @@ const PANEL_COOKIE = 'panel_token';
 // 时间工具
 // ══════════════════════════════════════════════════════════════════════════
 
+/** 北京时间日期字符串 YYYY-MM-DD，offsetDays 为相对今天的天数（负数表示过去） */
 function bjDate(offsetDays = 0) {
   return new Date(Date.now() + BJ_OFFSET_MS + offsetDays * 86400000)
     .toISOString()
     .slice(0, 10);
 }
 
+/** 北京时间日期时间字符串 YYYY-MM-DD HH:mm:ss */
 function bjDateTime() {
   return new Date(Date.now() + BJ_OFFSET_MS).toISOString().slice(0, 19).replace('T', ' ');
 }
 
+/** 北京时间当前小时 0-23 */
 function bjHour() {
   return new Date(Date.now() + BJ_OFFSET_MS).getUTCHours();
 }
 
+/** 保留 N 天（含今天）对应的裁剪下界，避免 date >= bjDate(-N) 多留一天 */
 function retentionCutoff(days) {
   return bjDate(-(Math.max(1, days) - 1));
 }
 
+/** 归一化日期为 YYYY-MM-DD，非法返回 null */
 function normalizeDate(value) {
   if (value == null) return null;
   const s = String(value).trim().slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
 }
 
+/** 归一化小时为 HH:00，接受 5 / '5' / '05' / '05:00' / '5:00'，非法返回 null */
 function normalizeHour(value) {
   if (value == null) return null;
   const m = String(value).trim().match(/^(\d{1,2})(?::\d{1,2})?$/);
@@ -84,12 +106,14 @@ function normalizeHour(value) {
 // 校验与格式化
 // ══════════════════════════════════════════════════════════════════════════
 
+/** 安全转数值：拒绝 NaN / Infinity / 负数，并夹到上限 */
 function toNumber(value, max = 1e12) {
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(n)) return 0;
   return Math.min(Math.max(n, 0), max);
 }
 
+/** 保留两位小数，抑制浮点累加误差 */
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
@@ -100,6 +124,7 @@ function isPlainObject(value) {
 
 const INVALID_DEVICE_IDS = new Set(['unknown', 'null', 'undefined', 'none', 'nil', 'n/a', 'na', '-', '0']);
 
+/** device_id 是否可用于做存储主键 */
 function isValidDeviceId(id) {
   if (id == null) return false;
   const s = String(id).trim();
@@ -107,10 +132,15 @@ function isValidDeviceId(id) {
   return !INVALID_DEVICE_IDS.has(s.toLowerCase());
 }
 
+/**
+ * IP 脱敏。必须在服务端执行——前端打码等于没打码，任何人 curl 一下
+ * /api/data 就能拿到全部服务器真实 IP。
+ */
 function maskIp(ip) {
   const s = String(ip ?? '').trim();
   if (!s || s === '-') return '-';
   if (s.includes(':')) {
+    // IPv6：截取前两段。必须先 slice 再过滤空串，否则 fe80::1 会被拼成 fe80:1
     const head = s.split(':').slice(0, 2).filter(Boolean);
     return head.length ? head.join(':') + '::*' : '*';
   }
@@ -120,6 +150,7 @@ function maskIp(ip) {
 
 const HTML_ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
+/** HTML 转义，阻断上报端 host 字段造成的存储型 XSS */
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => HTML_ESCAPE_MAP[ch]);
 }
@@ -172,6 +203,7 @@ function corsHeaders(env) {
   };
 }
 
+/** FNV-1a，用于生成 ETag */
 function fnv1a(str) {
   let hash = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
@@ -185,6 +217,7 @@ function fnv1a(str) {
 // 鉴权
 // ══════════════════════════════════════════════════════════════════════════
 
+/** 定长比较，避免通过响应时间差逐字节猜测密钥 */
 async function secureCompare(a, b) {
   const left = String(a ?? '');
   const right = String(b ?? '');
@@ -239,6 +272,10 @@ function parseBasicPassword(request) {
   }
 }
 
+/**
+ * 面板鉴权。未配置 PANEL_TOKEN 时直接放行，保持向后兼容。
+ * 返回非空 Response 表示需要立即返回（例如带 token 参数时的重定向）。
+ */
 async function assertPanelAccess(request, env, url) {
   const token = env.PANEL_TOKEN ? String(env.PANEL_TOKEN) : '';
   if (!token) return null;
@@ -252,6 +289,7 @@ async function assertPanelAccess(request, env, url) {
 
   for (const candidate of candidates) {
     if (await secureCompare(candidate, token)) {
+      // 通过 URL 参数首次访问时，写入 Cookie 并从地址栏抹掉 token
       if (url.searchParams.has('token')) {
         const clean = new URL(url.toString());
         clean.searchParams.delete('token');
@@ -293,6 +331,7 @@ async function readJson(kv, key) {
   }
 }
 
+/** 分页列举全部报告 key。原实现只取首页，超过 1000 台会静默漏机器 */
 async function listReportKeys(kv) {
   const keys = [];
   let cursor;
@@ -304,6 +343,7 @@ async function listReportKeys(kv) {
   return keys;
 }
 
+/** 有并发上限的 map，避免一次性打出上百个 KV 请求撞上 subrequest 限制 */
 async function mapLimit(items, limit, fn) {
   if (!items.length) return [];
   const results = new Array(items.length);
@@ -323,10 +363,7 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
-/** 
- * 【已修复】合并小时数据。用 Map 索引。
- * 严格校验日期，拒绝非法日期和未来时间，防止脚本传错时被强行归类到今天。
- */
+/** 合并小时数据。用 Map 索引，避免原先 O(n²) 的 findIndex */
 function mergeHourly(existing, incoming, today) {
   const map = new Map();
   for (const item of existing) {
@@ -334,14 +371,7 @@ function mergeHourly(existing, incoming, today) {
   }
   for (const raw of incoming) {
     if (!isPlainObject(raw) || raw.hour == null) continue;
-    
-    // 修复 1：去掉 || today 的兜底，日期解析失败直接丢弃，不污染今天的数据
-    const date = normalizeDate(raw.date);
-    if (!date) continue;
-
-    // 修复 2：拒绝未来时间，防止因脚本错误导致时间穿越
-    if (date > today) continue;
-
+    const date = normalizeDate(raw.date) || today;
     const hour = normalizeHour(raw.hour);
     if (!hour) continue;
 
@@ -358,12 +388,18 @@ function mergeHourly(existing, incoming, today) {
   return Array.from(map.values());
 }
 
+/** 按日期裁剪并排序小时数据 */
 function pruneHourly(list, cutoffDate) {
   return list
     .filter((item) => item && item.date && item.date >= cutoffDate)
     .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
 
+/**
+ * 由小时数据重建日汇总。
+ * 覆盖小时数据涉及的全部日期（而非只看本次上报的日期），可自动修复历史错误，
+ * 同时保留超出小时窗口的旧日数据。
+ */
 function aggregateDaily(hourly, previousDaily, cutoffDate) {
   const daily = isPlainObject(previousDaily) ? { ...previousDaily } : {};
   const sums = new Map();
@@ -381,6 +417,10 @@ function aggregateDaily(hourly, previousDaily, cutoffDate) {
 // 读数据
 // ══════════════════════════════════════════════════════════════════════════
 
+/**
+ * 对外视图：脱敏 IP、裁剪 hourly、只保留前端需要的字段。
+ * hourly 从 14 天（336 条/台）降到 2 天（48 条/台），payload 体积下降约 85%。
+ */
 function toPublicView(kvKey, report) {
   const keepDates = new Set();
   for (let i = 0; i < CONFIG.CLIENT_HOURLY_DAYS; i++) keepDates.add(bjDate(-i));
@@ -422,11 +462,13 @@ async function getReports(env) {
     .slice(0, CONFIG.MAX_REPORTS);
 }
 
+/** 剩余可用流量：无限额（max_gb 为 0）视为 Infinity，排最后 */
 function remainingQuota(report) {
   const max = toNumber(report.max_gb);
   return max > 0 ? max - toNumber(report.used_gb) : Infinity;
 }
 
+/** 按剩余流量升序——余量最紧张的机器排在卡片列表最前面 */
 function byRemainingQuota(a, b) {
   const ra = remainingQuota(a);
   const rb = remainingQuota(b);
@@ -461,6 +503,7 @@ async function readJsonBody(request, maxBytes) {
 const NUMERIC_FIELDS = ['rx', 'tx', 'yest_gb', 'today_gb', 'used_gb', 'max_gb', 'pct'];
 const TEXT_FIELDS = ['type', 'mode', 'period_start', 'period_end'];
 
+/** 按白名单合并上报字段，未出现的字段保留上次的值 */
 function mergeReportFields(previous, body) {
   const report = isPlainObject(previous) ? { ...previous } : {};
 
@@ -481,6 +524,7 @@ async function handleUpload(request, env) {
   await assertUploadKey(request, env);
   const body = await readJsonBody(request, CONFIG.MAX_BODY_BYTES);
 
+  // 优先用 CF 注入的真实来源 IP，请求体里的 ip 字段可被伪造
   const edgeIp = String(request.headers.get('CF-Connecting-IP') || '').trim();
   const bodyIp = String(body.ip || '').trim();
   const ip = edgeIp || bodyIp || '';
@@ -503,6 +547,8 @@ async function handleUpload(request, env) {
 
   if (Array.isArray(body.hourly) && body.hourly.length) {
     const merged = mergeHourly(hourly, body.hourly.slice(0, CONFIG.MAX_HOURLY_ENTRIES), today);
+    // 必须先聚合、后裁剪。顺序反了的话，机器离线数天后补传多天数据时，
+    // 超出小时窗口的日期会被裁掉，永远进不了日汇总，历史数据静默丢失。
     daily = aggregateDaily(merged, daily, retentionCutoff(CONFIG.DAILY_RETENTION_DAYS));
     hourly = pruneHourly(merged, retentionCutoff(CONFIG.HOURLY_RETENTION_DAYS));
   }
@@ -519,6 +565,7 @@ async function handleUpload(request, env) {
   try {
     await kv.put(kvKey, JSON.stringify(report));
   } catch (err) {
+    // KV 对同一 key 限制 1 次/秒写入，上报过于密集时会命中，给客户端明确的重试信号
     const message = String((err && err.message) || '');
     if (/429|rate limit|too many|quota/i.test(message)) {
       throw new HttpError(429, 'Too many writes for this key, retry later', { 'Retry-After': '2' });
@@ -539,6 +586,7 @@ function dataCacheKey(request) {
 }
 
 async function purgeDataCache(request) {
+  // 只清理当前数据中心的副本，其他 colo 依赖 TTL 自然过期
   try {
     await caches.default.delete(dataCacheKey(request));
   } catch {
@@ -546,6 +594,7 @@ async function purgeDataCache(request) {
   }
 }
 
+/** 取缓存命中结果，并把 Cache-Control 改回 no-store 交给客户端 */
 async function serveCachedData(cached) {
   const body = await cached.text();
   return new Response(body, {
@@ -645,12 +694,14 @@ export default {
       return await route(request, env, ctx);
     } catch (err) {
       if (err instanceof HttpError) {
+        // 5xx 属于服务端内部问题，只落日志，不把配置细节回显给客户端
         if (err.status >= 500) {
           console.error('[worker] server error:', err.message);
           return jsonResponse({ error: 'Internal Server Error' }, err.status);
         }
         return jsonResponse({ error: err.message }, err.status, err.headers);
       }
+      // 内部错误只进日志，不回显给客户端，避免泄露绑定名、堆栈等信息
       console.error('[worker] unhandled error:', (err && err.stack) || err);
       return jsonResponse({ error: 'Internal Server Error' }, 500);
     }
@@ -721,7 +772,7 @@ function htmlResponse(html, status = 200) {
   });
 }
 
-// ── 主面板 HTML ─────────────────
+// ── 主面板 HTML（模块级常量，只在 Worker 冷启动时求值一次）────────────────
 const MAIN_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -736,10 +787,18 @@ const MAIN_HTML = `<!DOCTYPE html>
 <link rel="icon" href="https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic_back-end/main/vps-traffic-logo-icon.ico">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <script>
+  // Chart.js 加载失败时自动切换备用 CDN
   if (!window.Chart) {
     document.write('<script src="https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js"><\\/script>');
   }
 <\/script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"><\/script>
+<script>
+  // 确保 zoom 插件注册（UMD 构建）
+  if (window.Chart && window.ChartZoom) {
+    Chart.register(ChartZoom);
+  }
+</script>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--border:#e8eaed;--text:#111;--muted:#6b7280;--accent:#0066ff}
 *{box-sizing:border-box}
@@ -795,7 +854,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   .tabs::-webkit-scrollbar{display:none}
   .tab{padding:6px 12px;font-size:12px}
   .chart-box{height:340px;padding:12px 14px}
-  .servers{grid-template-columns:1fr}
+  .servers{
+    display:flex;
+    overflow-x:auto;
+    gap:14px;
+    padding-bottom:8px;
+    scrollbar-width:thin;
+    -webkit-overflow-scrolling:touch;
+  }
+  .servers::-webkit-scrollbar{height:4px}
+  .servers::-webkit-scrollbar-thumb{background:#ddd;border-radius:2px}
+  .server{
+    flex:0 0 280px;
+    min-width:280px;
+  }
+  .empty{grid-column:auto;width:100%;flex:1 0 100%}
   .stat{padding:14px}
   .stat .value{font-size:1.3rem}
 }
@@ -865,6 +938,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     canvas: document.getElementById('chart')
   };
 
+  // ── 工具函数 ───────────────────────────────────────────────────────────
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
   function bjNow() { return new Date(Date.now() + BJ_OFFSET); }
@@ -894,11 +968,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     return m ? m[1] + ':' + m[2] : '';
   }
 
+  // YYYY-MM-DD 加减整数天（UTC 语义，与日期字符串一致）
   function addDays(dateStr, n) {
     var t = new Date(dateStr + 'T00:00:00Z').getTime() + n * 86400000;
     return isFinite(t) ? new Date(t).toISOString().slice(0, 10) : '';
   }
 
+  // ── 数据计算 ───────────────────────────────────────────────────────────
+  // 剩余可用流量：无限额视为 Infinity 排最后；与后端 byRemainingQuota 保持一致
   function remainingGB(report) {
     var max = num(report.max_gb);
     return max > 0 ? max - num(report.used_gb) : Infinity;
@@ -913,6 +990,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     return ra - rb;
   }
 
+  // 今日/昨日流量统一入口，避免卡片、统计、图表三处各算一套
   function dayTotalGB(report, date) {
     var daily = report.daily || {};
     if (daily[date] != null) return num(daily[date]) / 1024;
@@ -947,6 +1025,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     });
   }
 
+  // ── 渲染 ───────────────────────────────────────────────────────────────
   function renderServers() {
     if (!state.reports.length) {
       el.servers.innerHTML = '<div class="empty">还没有收到上报数据<br>检查 VPS 上的上报脚本是否正常运行</div>';
@@ -1015,8 +1094,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
         '<div class="value" style="color:' + pctColor + '">' + pct + '%</div></div>';
   }
 
+  // ── 图表 ───────────────────────────────────────────────────────────────
   function buildLabels(isHourly) {
     if (isHourly) {
+      // 当前小时还没结束，上报脚本必然还没提交这一小时的数据，直接不画；
+      // 已经结束的小时一律画出来，没上报的按 0 补齐。
+      // 昨天 24 小时全部已结束，固定画满 00:00~23:00。
       var maxH = state.range === 'today' ? bjNow().getUTCHours() - 1 : 23;
       var labels = [];
       for (var h = 0; h <= maxH; h++) labels.push(pad2(h) + ':00');
@@ -1069,6 +1152,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     var selected = visibleReports();
     var targetDate = range === 'today' ? bjDateStr(0) : bjDateStr(-1);
 
+    // 只遍历一次：既产出 values，又顺带求出全局最大值
     var built = buildLabels(isHourly);
     var labels = built.labels;
     var maxGB = 0;
@@ -1098,6 +1182,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 
     var narrow = window.innerWidth < 640;
     var datasets = rows.map(function (row) {
+      // label 始终用全名，tooltip 才能看到完整主机名；
+      // 图例空间不够，由下方 generateLabels 按显示宽度单独截断
       var name = row.report.host || ('服务器' + (row.index + 1));
       var color = SERIES_COLORS[row.index % SERIES_COLORS.length];
       return {
@@ -1114,10 +1200,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     });
 
     var scopeLabel = state.selected.size ? state.selected.size + '台' : '全部';
+    var lastLabel = isHourly && labels.length ? labels[labels.length - 1] : '';
     el.desc.textContent =
       (RANGE_TITLES[range] || '') + ' · ' + scopeLabel + ' · 单位：' + unitInfo.unit +
       (state.generatedAt ? ' · 更新于 ' + state.generatedAt.slice(11) : '') +
-      (isHourly && !labels.length ? ' · 当天暂无完整小时数据' : '');
+      (isHourly && !labels.length ? ' · 当天暂无完整小时数据' : '') +
+      (lastLabel ? ' · 截至 ' + lastLabel : '');
 
     var options = {
       responsive: true,
@@ -1125,14 +1213,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       animation: { duration: 250 },
       interaction: { mode: 'index', intersect: false },
       plugins: {
+        // 画布内图例单行绘制、不会换行，机器一多就被裁掉；
+        // 改用图表下方的 HTML 图例（#legend），可自动换行、可点击隐藏系列
         legend: { display: false },
         tooltip: {
           mode: 'index',
           intersect: false,
           callbacks: {
             label: function (ctx) {
+              // parsed.y 是缩放后的值，先还原成 GB 再格式化
               return ctx.dataset.label + ': ' + formatFromGB(ctx.parsed.y / scale);
             }
+          }
+        },
+        zoom: {
+          pan: {
+            enabled: true,
+            mode: 'x'
+          },
+          zoom: {
+            pinch: { enabled: true },
+            mode: 'x'
+          },
+          limits: {
+            x: { min: 'original', max: 'original' }
           }
         }
       },
@@ -1144,7 +1248,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
           title: { display: true, text: unitInfo.unit, color: '#888', font: { size: 12 } }
         },
         x: {
-          ticks: { color: '#888', maxRotation: 0, autoSkip: true, maxTicksLimit: narrow ? 6 : 12 },
+          // 窄屏原本只显示到 16:00，末尾几点没有时间刻度、且末点紧贴右边缘像被裁掉：
+          // 加密刻度 + 两端留白，并在描述里注明数据截止时间
+          offset: narrow,
+          ticks: { color: '#888', maxRotation: 0, autoSkip: true, maxTicksLimit: narrow ? 8 : 12 },
           grid: { color: '#f0f0f0' }
         }
       }
@@ -1166,6 +1273,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     renderLegend(datasets);
   }
 
+  // ── HTML 图例 ───────────────────────────────────────────────────────────
+  // flex-wrap 自动换行，放多少台都显示得全；点击可显示/隐藏对应系列
   function renderLegend(datasets) {
     if (!datasets.length) {
       el.legend.innerHTML = '';
@@ -1203,6 +1312,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     drawChart();
   }
 
+  // ── 数据加载 ───────────────────────────────────────────────────────────
   function load() {
     if (state.loading) return Promise.resolve();
     state.loading = true;
@@ -1214,6 +1324,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       })
       .then(function (data) {
         state.reports = Array.isArray(data.reports) ? data.reports : [];
+        // 本地再排一次：即使命中旧缓存（按旧规则排序）也能按剩余流量显示
         state.reports.sort(byRemaining);
         state.generatedAt = data.generated_at || '';
         render();
@@ -1228,6 +1339,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       });
   }
 
+  // ── 交互 ───────────────────────────────────────────────────────────────
+  // 事件委托：只在容器上绑一次，避免每次 render 重建按钮并重复绑定
   el.servers.addEventListener('click', function (e) {
     var card = e.target.closest('.server');
     if (!card) return;
@@ -1256,6 +1369,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     render();
   });
 
+  // ── 自定义日期区间 ──────────────────────────────────────────────────────
+  // 规则：起止不能同一天，end 必须晚于 start；start 最晚选昨天，end 最晚今天
   function syncDateConstraints() {
     var start = el.startDate.value;
     el.dateHint.textContent = '';
@@ -1265,6 +1380,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     }
     var minEnd = addDays(start, 1);
     el.endDate.min = minEnd;
+    // 键盘输入等方式绕过 min 限制时自动纠正
     if (el.endDate.value && el.endDate.value <= start) {
       el.endDate.value = minEnd;
     }
@@ -1275,6 +1391,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 
   el.startDate.addEventListener('change', syncDateConstraints);
 
+  // 改结束日期时若与开始日期冲突，把开始日期调到结束前一天
   el.endDate.addEventListener('change', function () {
     var end = el.endDate.value;
     var start = el.startDate.value;
@@ -1299,6 +1416,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     render();
   });
 
+  // 窗口尺寸变化时重算标签截断和刻度密度（原实现只在首次渲染时判断一次）
   var resizeTimer = null;
   window.addEventListener('resize', function () {
     clearTimeout(resizeTimer);
@@ -1307,6 +1425,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     }, 200);
   });
 
+  // 轮询：页面不可见时暂停，回到前台立即刷新
   var pollTimer = null;
 
   function startPolling() {
@@ -1350,6 +1469,7 @@ function serveMain(request) {
   return new Response(MAIN_HTML, {
     headers: baseHeaders({
       'Content-Type': 'text/html; charset=utf-8',
+      // HTML 内容随代码版本变化，用 ETag 协商，避免每次都全量重传
       'Cache-Control': 'no-cache',
       ETag: MAIN_HTML_ETAG,
       'X-Frame-Options': 'DENY',
@@ -1357,6 +1477,7 @@ function serveMain(request) {
   });
 }
 
+// 导出纯函数供单元测试使用（不影响 Worker 运行时）
 export {
   bjDate,
   bjDateTime,
