@@ -1293,24 +1293,35 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
           title: { display: true, text: unitInfo.unit, color: '#888', font: { size: 12 } }
         },
         x: {
-          // 窄屏标签太多会挤在一起。目标：窄屏约 5-6 个标签，宽屏约 10 个。
-          // 始终强制显示首尾（保证能看到 23:00），中间按动态步长抽样。
+          // 窄屏刻度标签竖排（旋转 90°），彻底避免横向挤压；
+          // 宽屏保持水平，靠动态步长控制密度。
           offset: narrow,
           ticks: {
             color: '#888',
-            maxRotation: 0,
+            maxRotation: narrow ? 90 : 0,
+            minRotation: narrow ? 90 : 0,
             autoSkip: false,
             font: { size: narrow ? 10 : 12 },
             callback: function(value, index, ticks) {
-              // 始终显示第一个和最后一个
-              if (index === 0 || index === ticks.length - 1) {
-                return this.getLabelForValue(value);
-              }
+              var label = this.getLabelForValue(value);
               var total = ticks.length;
-              // 窄屏目标 ~6 个标签，宽屏 ~12 个
-              var desired = narrow ? 6 : 12;
-              var step = Math.max(1, Math.floor(total / desired));
-              return (index % step === 0) ? this.getLabelForValue(value) : '';
+              var last = total - 1;
+              // 窄屏：竖排后横向不挤压，默认每小时都显示（最多约 24 个）
+              if (narrow) {
+                var s = Math.max(1, Math.ceil(total / 24));
+                if (index % s === 0) return label;
+                // 末尾最新小时也显示；除非它紧挨上一个（s=2 时错开一位）
+                if (index === last && last % s !== 1) return label;
+                return '';
+              }
+              // 宽屏：目标 ~12 个标签
+              var step = Math.max(1, Math.floor(total / 12));
+              // 始终显示第一个和最后一个
+              if (index === 0 || index === last) return label;
+              // 末尾刻度被强制显示时，若它恰好紧挨上一个被抽中的刻度
+              //（last % step === 1），隐藏后者避免文字重叠
+              if (index === last - 1 && last % step === 1) return '';
+              return (index % step === 0) ? label : '';
             }
           },
           grid: { color: '#f0f0f0' }
