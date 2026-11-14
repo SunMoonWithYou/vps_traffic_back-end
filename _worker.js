@@ -456,26 +456,45 @@ async function getReports(env) {
     return report ? toPublicView(key, report) : null;
   });
 
-  return loaded
-    .filter(Boolean)
-    .sort(byRemainingQuota)
-    .slice(0, CONFIG.MAX_REPORTS);
+  const visible = loaded.filter(Boolean);
+  visible.sort(byLatestHourTraffic(visible));
+  return visible.slice(0, CONFIG.MAX_REPORTS);
 }
 
-/** 剩余可用流量：无限额（max_gb 为 0）视为 Infinity，排最后 */
-function remainingQuota(report) {
-  const max = toNumber(report.max_gb);
-  return max > 0 ? max - toNumber(report.used_gb) : Infinity;
+/** 今日所有机器里最新的一个已完成小时（全局统一基准），没有则返回 null */
+function latestGlobalHourKey(reports) {
+  const today = bjDate(0);
+  let best = null;
+  for (const report of reports) {
+    const hourly = Array.isArray(report.hourly) ? report.hourly : [];
+    for (const item of hourly) {
+      if (!item || item.date !== today || !item.key) continue;
+      if (!best || item.key > best) best = item.key;
+    }
+  }
+  return best;
 }
 
-/** 按剩余流量升序——余量最紧张的机器排在卡片列表最前面 */
-function byRemainingQuota(a, b) {
-  const ra = remainingQuota(a);
-  const rb = remainingQuota(b);
-  if (ra === rb) return String(a.host).localeCompare(String(b.host), 'zh-CN');
-  if (!Number.isFinite(ra)) return 1;
-  if (!Number.isFinite(rb)) return -1;
-  return ra - rb;
+/** 指定小时的上报流量（MB）；该小时没有数据按 0 处理（离线/未上报排最后） */
+function hourTrafficMbAt(report, hourKey) {
+  if (!hourKey) return 0;
+  const hourly = Array.isArray(report.hourly) ? report.hourly : [];
+  for (const item of hourly) {
+    if (item && item.key === hourKey) return toNumber(item.total_mb);
+  }
+  return 0;
+}
+
+/**
+ * 按今日最新小时流量降序——所有机器统一用全局最新的那个小时作基准，
+ * 保证卡片顺序和图表 tooltip 里同一小时的数值顺序一致。
+ * 返回一个比较器（需要先扫描一遍数据求全局小时，所以用工厂函数）。
+ */
+function byLatestHourTraffic(reports) {
+  const hourKey = latestGlobalHourKey(reports);
+  return (a, b) =>
+    hourTrafficMbAt(b, hourKey) - hourTrafficMbAt(a, hourKey) ||
+    String(a.host).localeCompare(String(b.host), 'zh-CN');
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -974,19 +993,39 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   }
 
   // ── 数据计算 ───────────────────────────────────────────────────────────
-  // 剩余可用流量：无限额视为 Infinity 排最后；与后端 byRemainingQuota 保持一致
-  function remainingGB(report) {
-    var max = num(report.max_gb);
-    return max > 0 ? max - num(report.used_gb) : Infinity;
+  // 今日所有机器里最新的一个已完成小时（全局统一基准），没有则返回 null
+  function latestGlobalHourKey(reports) {
+    var todayStr = bjDateStr(0);
+    var best = null;
+    for (var i = 0; i < reports.length; i++) {
+      var hourly = reports[i].hourly || [];
+      for (var j = 0; j < hourly.length; j++) {
+        var h = hourly[j];
+        if (!h || h.date !== todayStr || !h.key) continue;
+        if (!best || h.key > best) best = h.key;
+      }
+    }
+    return best;
   }
 
-  function byRemaining(a, b) {
-    var ra = remainingGB(a);
-    var rb = remainingGB(b);
-    if (ra === rb) return String(a.host).localeCompare(String(b.host), 'zh-CN');
-    if (!isFinite(ra)) return 1;
-    if (!isFinite(rb)) return -1;
-    return ra - rb;
+  // 指定小时的上报流量（MB）；该小时没有数据按 0 处理（离线/未上报排最后）
+  function hourTrafficMbAt(report, hourKey) {
+    if (!hourKey) return 0;
+    var hourly = report.hourly || [];
+    for (var i = 0; i < hourly.length; i++) {
+      if (hourly[i] && hourly[i].key === hourKey) return num(hourly[i].total_mb);
+    }
+    return 0;
+  }
+
+  // 排序比较器工厂：所有机器统一用全局最新小时，和图表 tooltip 同小时数值顺序一致
+  function makeByLatestHour(reports) {
+    var hourKey = latestGlobalHourKey(reports);
+    return function (a, b) {
+      var diff = hourTrafficMbAt(b, hourKey) - hourTrafficMbAt(a, hourKey);
+      if (diff) return diff;
+      return String(a.host).localeCompare(String(b.host), 'zh-CN');
+    };
   }
 
   // 今日/昨日流量统一入口，避免卡片、统计、图表三处各算一套
@@ -1034,19 +1073,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     var todayStr = bjDateStr(0);
     var parts = [];
 
+    // 卡片右上角显示排序依据：全局最新小时的流量（所有机器同一小时，便于对照图表）；
+    // 没有任何小时数据时回退为更新时间
+    var hourKey = latestGlobalHourKey(state.reports);
+
     state.reports.forEach(function (r) {
       var pct = parseInt(r.pct, 10) || 0;
       var active = state.selected.has(r.id) ? ' active' : '';
       var color = pct >= 90 ? '#ef4444' : pct >= 70 ? '#f97316' : pct >= 50 ? '#eab308' : '#22c55e';
       var today = dayTotalGB(r, todayStr).toFixed(2);
       var time = formatHourLabel(r.updated_bj);
+      var rightHtml = hourKey
+        ? escapeHtml(hourKey.slice(11)) + ' · ' + formatFromGB(hourTrafficMbAt(r, hourKey) / 1024)
+        : (time ? escapeHtml(time) : '');
 
       parts.push(
         '<div class="server' + active + '" data-id="' + escapeHtml(r.id) + '">' +
           '<h3 title="' + escapeHtml(r.host) + '">' + escapeHtml(r.host) + '</h3>' +
           '<div class="sub">' +
             '<span class="today">今日 ' + today + ' GB</span>' +
-            (time ? '<span>' + escapeHtml(time) + '</span>' : '') +
+            (rightHtml ? '<span>' + rightHtml + '</span>' : '') +
           '</div>' +
           '<div class="ip">' + escapeHtml(r.ip) + '</div>' +
           '<div class="usage">' + fixed2(r.used_gb) + ' / ' + fixed2(r.max_gb) + ' GB</div>' +
@@ -1226,6 +1272,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
           padding: 10,
           cornerRadius: 8,
           displayColors: true,
+          // 悬停提示里的机器按当前悬停小时的流量从高到低实时排序，
+          // 和显示的数值严格对应，不依赖卡片列表顺序
+          itemSort: function (a, b) {
+            return b.parsed.y - a.parsed.y;
+          },
           callbacks: {
             label: function (ctx) {
               // parsed.y 是缩放后的值，先还原成 GB 再格式化
@@ -1334,8 +1385,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       })
       .then(function (data) {
         state.reports = Array.isArray(data.reports) ? data.reports : [];
-        // 本地再排一次：即使命中旧缓存（按旧规则排序）也能按剩余流量显示
-        state.reports.sort(byRemaining);
+        // 本地再排一次：即使命中旧缓存（按旧规则排序）也能按最新小时流量显示
+        state.reports.sort(makeByLatestHour(state.reports));
         state.generatedAt = data.generated_at || '';
         render();
       })
