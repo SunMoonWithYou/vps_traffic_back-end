@@ -792,15 +792,9 @@ const MAIN_HTML = `<!DOCTYPE html>
     document.write('<script src="https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js"><\\/script>');
   }
 <\/script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"><\/script>
-<script>
-  // 确保 zoom 插件注册（UMD 构建）
-  if (window.Chart && window.ChartZoom) {
-    Chart.register(ChartZoom);
-  }
-</script>
+
 <style>
-:root{--bg:#f5f7fa;--card:#fff;--border:#e8eaed;--text:#111;--muted:#6b7280;--accent:#0066ff}
+:root{--bg:#f8fafc;--card:#fff;--border:#e2e8f0;--text:#0f172a;--muted:#64748b;--accent:#2563eb}
 *{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;min-height:100vh;-webkit-font-smoothing:antialiased}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;flex-wrap:wrap;gap:16px}
@@ -812,12 +806,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .tab:hover{color:#111}
 .tab.active{background:#f0f4ff;color:#0066ff;font-weight:600}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
-.stat{background:#fff;border-radius:14px;padding:18px 20px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.04);min-width:0}
+.stat{background:#fff;border-radius:14px;padding:18px 20px;border:1px solid var(--border);box-shadow:0 1px 2px rgba(0,0,0,0.04),0 4px 12px rgba(0,0,0,0.03);min-width:0}
 .stat .label{font-size:12px;color:var(--muted);font-weight:500}
 .stat .value{font-size:1.65rem;font-weight:650;margin-top:6px;color:#111;word-break:break-all}
 .stat .value small{font-size:.85rem;font-weight:400;color:var(--muted)}
 .stat .sub{font-size:12px;color:var(--muted);margin-top:4px}
-.chart-box{background:#fff;border-radius:14px;padding:16px 20px 14px;border:1px solid var(--border);margin-bottom:22px;height:420px;box-shadow:0 1px 3px rgba(0,0,0,.04);display:flex;flex-direction:column}
+.chart-box{background:#fff;border-radius:14px;padding:16px 20px 14px;border:1px solid var(--border);margin-bottom:22px;height:420px;box-shadow:0 1px 2px rgba(0,0,0,0.04),0 4px 12px rgba(0,0,0,0.03);display:flex;flex-direction:column}
 .chart-wrap{flex:1;min-height:120px;position:relative}
 .chart-wrap canvas{width:100%!important;height:100%!important}
 #legend{display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:center;padding-top:10px;font-size:12px;color:#666}
@@ -827,8 +821,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .legend-item.off{opacity:.35}
 .legend-item.off .legend-name{text-decoration:line-through}
 .servers{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
-.server{background:#fff;border-radius:14px;padding:16px 18px;border:1px solid var(--border);cursor:pointer;transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 3px rgba(0,0,0,.04)}
-.server:hover{border-color:#c7d2fe;box-shadow:0 4px 12px rgba(0,102,255,.08)}
+.server{background:#fff;border-radius:14px;padding:16px 18px;border:1px solid var(--border);cursor:pointer;transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 2px rgba(0,0,0,0.04),0 4px 12px rgba(0,0,0,0.03)}
+.server:hover{border-color:#bfdbfe;box-shadow:0 4px 16px rgba(37,99,235,.08)}
 .server.active{border-color:#0066ff;box-shadow:0 0 0 3px rgba(0,102,255,.12)}
 .server h3{margin:0 0 4px;font-size:1rem;font-weight:600;white-space:normal;word-break:break-word;overflow-wrap:anywhere}
 .server .sub{font-size:12px;color:#888;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -853,20 +847,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   .tabs{width:100%;overflow-x:auto;scrollbar-width:none}
   .tabs::-webkit-scrollbar{display:none}
   .tab{padding:6px 12px;font-size:12px}
-  .chart-box{height:340px;padding:12px 14px}
+  .chart-box{height:380px;padding:12px 14px}
   .servers{
     display:flex;
-    overflow-x:auto;
-    gap:14px;
-    padding-bottom:8px;
-    scrollbar-width:thin;
-    -webkit-overflow-scrolling:touch;
+    flex-direction:column;
+    overflow-x:visible;
+    gap:12px;
+    padding-bottom:4px;
   }
-  .servers::-webkit-scrollbar{height:4px}
-  .servers::-webkit-scrollbar-thumb{background:#ddd;border-radius:2px}
   .server{
-    flex:0 0 280px;
-    min-width:280px;
+    flex:none;
+    min-width:0;
+    width:100%;
   }
   .empty{grid-column:auto;width:100%;flex:1 0 100%}
   .stat{padding:14px}
@@ -916,6 +908,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   var SERIES_COLORS = ['#22c55e', '#3b82f6', '#f97316', '#a855f7', '#ef4444', '#06b6d4', '#eab308', '#ec4899'];
   var RANGE_TITLES = { today: '今天', yesterday: '昨天', '7d': '近7天', '30d': '近30天', all: '全部', custom: '自定义' };
 
+  // 全局状态
+  // reports   : 从 /api/data 拿到的服务器列表
+  // range     : 当前时间范围 today / yesterday / 7d / 30d / all / custom
+  // selected  : 用户点击卡片选中的服务器 id 集合（空表示全部）
+  // chart     : Chart.js 实例
+  // generatedAt: 后端生成数据的北京时间
+  // loading   : 防止并发请求
   var state = {
     reports: [],
     range: 'today',
@@ -1190,12 +1189,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
         label: name,
         data: row.values.map(function (v) { return +(v * scale).toFixed(2); }),
         borderColor: color,
-        backgroundColor: color + '22',
+        backgroundColor: color + '18',
         fill: true,
-        tension: 0.3,
+        tension: 0.35,
         pointRadius: narrow ? 0 : 2,
         pointHoverRadius: 4,
-        borderWidth: 2
+        borderWidth: 2.2
       };
     });
 
@@ -1219,24 +1218,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
         tooltip: {
           mode: 'index',
           intersect: false,
+          backgroundColor: 'rgba(15, 23, 42, 0.92)',
+          titleColor: '#e2e8f0',
+          bodyColor: '#cbd5e1',
+          borderColor: 'rgba(255,255,255,0.08)',
+          borderWidth: 1,
+          padding: 10,
+          cornerRadius: 8,
+          displayColors: true,
           callbacks: {
             label: function (ctx) {
               // parsed.y 是缩放后的值，先还原成 GB 再格式化
               return ctx.dataset.label + ': ' + formatFromGB(ctx.parsed.y / scale);
             }
-          }
-        },
-        zoom: {
-          pan: {
-            enabled: true,
-            mode: 'x'
-          },
-          zoom: {
-            pinch: { enabled: true },
-            mode: 'x'
-          },
-          limits: {
-            x: { min: 'original', max: 'original' }
           }
         }
       },
@@ -1248,10 +1242,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
           title: { display: true, text: unitInfo.unit, color: '#888', font: { size: 12 } }
         },
         x: {
-          // 窄屏原本只显示到 16:00，末尾几点没有时间刻度、且末点紧贴右边缘像被裁掉：
-          // 加密刻度 + 两端留白，并在描述里注明数据截止时间
+          // 窄屏标签太多会挤在一起。目标：窄屏约 5-6 个标签，宽屏约 10 个。
+          // 始终强制显示首尾（保证能看到 23:00），中间按动态步长抽样。
           offset: narrow,
-          ticks: { color: '#888', maxRotation: 0, autoSkip: true, maxTicksLimit: narrow ? 8 : 12 },
+          ticks: {
+            color: '#888',
+            maxRotation: 0,
+            autoSkip: false,
+            font: { size: narrow ? 10 : 12 },
+            callback: function(value, index, ticks) {
+              // 始终显示第一个和最后一个
+              if (index === 0 || index === ticks.length - 1) {
+                return this.getLabelForValue(value);
+              }
+              var total = ticks.length;
+              // 窄屏目标 ~6 个标签，宽屏 ~12 个
+              var desired = narrow ? 6 : 12;
+              var step = Math.max(1, Math.floor(total / desired));
+              return (index % step === 0) ? this.getLabelForValue(value) : '';
+            }
+          },
           grid: { color: '#f0f0f0' }
         }
       }
